@@ -1,0 +1,712 @@
+
+---
+title: "Applying a genetic risk score for prostate cancer to men with lower urinary tract symptoms in primary care to predict prostate cancer diagnosis: a cohort study in the UK Biobank"
+author: "Harry D Green, Samuel WD Merriel, Richard A Oram, Katherine S Ruth, Jessica Tyrrell, Samuel E Jones, Chrissie Thirlwell, Michael N Weedon, Sarah ER Bailey"
+date: "19/04/2022"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r readme, include=FALSE}
+
+# This RMarkdown document contains the analysis code used to produce results for the paper "Applying a genetic risk score for prostate cancer to men with lower urinary tract symptoms in primary care to predict prostate cancer diagnosis: a cohort study in the UK Biobank" by Green et. al. All analysis code was written by Harry Green (h.d.green@exeter.ac.uk).
+
+# For those unfamiliar with RMarkdown, code between ``` characters is a block of R code which will run like any other. Text outside of these code blocks will be compiled into a word document
+
+# As the document is edited between running this code and submitting the paper, there may be some minor wording differences between this document and the published version. This document was produced during revision 1 of the paper submission process. File paths, user names and password have been hidden
+
+```
+
+```{r, include=FALSE}
+
+
+## SET UP BLOCK - NOTHING HAPPENS HERE
+
+#New criteria - first symptom 60 or greater, if symptom at 40 and 61, take symptom at 61 as index date
+
+# Read in necessary libraries
+library(RMySQL)
+library(dplyr)
+library(readr)
+library(readstata13)
+library(ggplot2)
+library(pROC)
+library(matrixStats)
+library(survminer)
+library(survival)
+library(tidyverse) 
+library(DiagrammeR)
+library(epiR)
+
+setwd('/slade/home/hdg204/Prostate_Cancer')
+```
+
+```{r, include=FALSE}
+
+# This chunk is the data reading chunk, where I read in and clean the data
+
+#x is the number of years of follow-up post-symptom. This number is used frequently throughout the code and is defined here for convenient change
+x=2
+
+# set up a connection to the database holding GP record data
+lapply( dbListConnections( dbDriver( drv = "MySQL")), dbDisconnect) 
+con <- dbConnect(MySQL(),dbname="__________",password='_______________')
+
+# First read in the dates of birth of all individuals from the UK Biobank. As the exact date of birth is not known, we assume the 'day' of birth to be the 15th to minimise potential maximum error
+ukbb_dobs=read.dta13("_______________________",select.cols=c('n_eid','age_base','n_34_0_0','n_52_0_0')) 
+ukbb_dobs$dob=paste(ukbb_dobs$n_34_0_0,ukbb_dobs$n_52_0_0,15,sep='-')%>%as.Date() 
+
+# Next read in basic covariates from the UKBB Baseline
+covars=read.dta13("_____________",select.cols=c('n_eid','sex','age_base','cov_tdi','cov_bmi_2016','whr','smoker','cig_per_day','alcohol_units',"pc1","pc2","pc3","pc4","pc5","chip","centre"))%>%
+  rename(tdi=cov_tdi,bmi=cov_bmi_2016)
+
+# all_data will remain a wide format dataframe, one line per person. Currently it just has the covariates to be used in the model. It's also useful to know how many have GP records
+all_data=full_join(ukbb_dobs,covars)
+gp_records=dbSendQuery(con,"select DISTINCT n_eid from UKB_GP_RECORDS.gp_clinical_230K_171019") %>% fetch(rsa, n=-1)%>%mutate(gp_records=1)
+all_data=full_join(all_data,gp_records)
+
+# Read prostate cancer ICD10 data from the cancer registry data
+prost_ICD10=read.dta13("____________________")%>%
+  select(n_eid,date_1st_cr_prost_ca_2021,prost_ca_2021_any)%>%rename(ICD_prca=prost_ca_2021_any,ICD_prca_date=date_1st_cr_prost_ca_2021)
+
+# Query the Database connection for prostate cancer diagnoses in GP
+prost_GP=dbSendQuery(con,"select * from UKB_GP_RECORDS.gp_clinical_230K_171019 where read_3='B46..'") %>% fetch(rsa, n=-1)%>%
+  rename(GP_prca_date=event_dt)%>%mutate(GP_prca=1)%>%select(n_eid,GP_prca_date,GP_prca)%>%mutate(GP_prca_date=as.Date(GP_prca_date))
+
+# select the earliest diagnosis
+prost_GP2=prost_GP%>%group_by(n_eid)%>%top_n(-1,GP_prca_date)%>%
+  filter(GP_prca_date>as.Date("1910-02-02")) # Eliminate all diagnoses before 1910 (this eliminates coded UKBB dates)
+  
+# join them together,and if the result is NA that means they weren't in the table, so make it 0
+all_prost=full_join(prost_ICD10,prost_GP2)
+all_prost$ICD_prca[is.na(all_prost$ICD_prca)]=0
+all_prost$GP_prca[is.na(all_prost$GP_prca)]=0
+
+#I want to have the age at which cancer happens first, so I'm going to full_join the dates of birth into this, and then calculate cancer age. I always use age as my time unit rather than date.
+all_prost=full_join(all_prost,ukbb_dobs)
+
+#Now I want the age both of them happened and also the first one
+all_prost=all_prost%>%mutate(ICD10_prca_age=ICD_prca_date-dob,GP_prca_age=GP_prca_date-dob)%>%
+  mutate(ICD10_prca_age=as.numeric(ICD10_prca_age/365.25),GP_prca_age=as.numeric(GP_prca_age/365.25))%>%
+  mutate(first_prca=pmin(ICD10_prca_age,GP_prca_age,na.rm=TRUE))%>%
+  mutate(prca=!is.na(first_prca)) #if first_prca is not na then they had prostate cancer
+all_data=full_join(all_data,all_prost)
+
+#Read and join in the GRS
+grs=read.csv("_________________________",sep="\t")%>%rename(n_eid=id)
+all_data=inner_join(all_data,grs)
+
+
+## Read symptoms from the gp records
+
+codes=read_table('cancercodes',FALSE)  #cancercodes and codecategories contain the information in Supplementary Table 1
+codecategories=read_table('CodeCategories2',FALSE) %>% rename(read_3=X1,category=X2) #a table with which symptom each code is
+gp_records=NULL
+for (i in 1:nrow(codes)){ #go through all the codes and compile a big dataframe
+  dataquery=paste("select * from UKB_GP_RECORDS.gp_clinical_230K_171019 where read_3='",codes$X1[i] ,"'",sep="")
+  tab=dbSendQuery(con,dataquery) %>% fetch(rsa, n=-1)
+  gp_records=rbind(gp_records,tab)
+}
+gp_records=inner_join(gp_records,codecategories) #GP records now has ALL of the relevant data. I will pull out wide format dataframes from this whenever I want stuff
+
+#I want to convert everything to an age
+gp_records=full_join(gp_records,ukbb_dobs)%>%
+  mutate(event_dt=as.Date(event_dt))%>%mutate(event_age=as.numeric(event_dt-dob)/365.25)%>%
+  filter(event_age>40) #all symptoms must be over 40 as part of the exclusion criteria
+
+symptoms=codecategories$category%>%unique()
+symptoms=symptoms[1:(length(symptoms)-2)] # this is a list of the symptoms without prostate cancer and PSA tests in it
+
+## now I need a loop that goes through all the symptoms and makes a wide data frame with n_eid, the symptom with a column of 1s, and the symptom age, but it has to be the minimum symptom age for each person
+for (i in 1:length(symptoms)){
+  tempframe=filter(gp_records,category==symptoms[i])%>%group_by(n_eid)%>%mutate(a=1)%>%mutate(b=min(event_age)) # this takes the gp records with the symptom and stores a column of 1s in a and the earliest age in b
+  tempframe=select(tempframe,c('n_eid','a','b')) #this gets rid of the other crap
+  names(tempframe)[names(tempframe)=='a']=symptoms[i]
+  names(tempframe)[names(tempframe)=='b']=paste(symptoms[i],'age',sep='_') #rename a and b to be symptom and symptom_age
+  tempframe=tempframe%>%distinct() #remove duplicates
+  all_data=full_join(all_data,tempframe) # merge into model frame
+}
+
+#turn all the na symptoms to 0
+for (i in 1:length(symptoms)){
+  all_data[,symptoms[i]][is.na(all_data[,symptoms[i]])]=0 #for all model frame rows where the symptom is symptom i, if that row is na, make it 0
+}
+
+# now I have all the symptoms I need to define the index date
+all_symptom_ages=all_data[,names(all_data)%in%paste(symptoms,'age',sep='_')] # make a df that's all the symptom_ages
+all_data$indexage=rowMins(as.matrix(all_symptom_ages),na.rm=TRUE) #and then convert it to a matrix and rowMin it
+all_data$indexage[all_data$indexage>100]=NA
+#indexage is the age at first symptom, this is a very important age for everything going forward. So important I'm making a new dataframe just for that
+
+#Now I want to exclude every symptom that is more than 0 above the index age because I don't care about symptoms that happen after
+for (i in 1:length(symptoms)){
+  index=all_data[,paste(symptoms[i],'age',sep='_')]-all_data$indexage==0 #this makes a list of trues, falses and nas. It's true if the event was in the followup, false if it's out, and NA if it didn't occur. The NAs should be false
+  index[is.na(index)]=FALSE
+  # index is now exactly what I want the symptom column to be
+  all_data[,symptoms[i]]=index
+}
+
+#all symptoms are now valid so I can sum them to produce a new variable that's the total number of symptoms everyone had
+symptom_frame_temp=all_data[,names(all_data)%in%symptoms] # make a df that's all the symptoms
+all_data$totalsymptoms=rowSums(symptom_frame_temp) #add them up and make it a column
+
+
+# performs necessary data cleaning
+
+all_data=filter(all_data,sex==1)%>% #only the men
+  mutate(valid_prca= (first_prca>=indexage) & (first_prca<=indexage+x)) #valid prca is any between index age and indexage + x
+#this makes the invalid prcas false and the non prcas NA for valid_prca, excluding all controls from the data, so I'll make them zero manually
+all_data$valid_prca[is.na(all_data$valid_prca)]=FALSE
+all_data$prca[is.na(all_data$prca)]=FALSE
+
+# if someone dies between the index age and index age + x, and they had cancer, they stay a case. If they were a control, valid_prca needs to be NA to exclude them from the case-control analysis
+
+death=read.dta13("_______________________")%>%inner_join(ukbb_dobs)
+death=mutate(death,death_age=as.numeric(as.Date(n_40000_0_0)-as.Date(dob))/365.25)%>%mutate(prca_death=0)
+death$prca_death[death$n_40001_0_0=="C61 Malignant neoplasm of prostate"]=1
+
+all_data=all_data%>%left_join(death%>%select(n_eid,n_40001_0_0,death_age,prca_death))%>%mutate(death_t=death_age-indexage)
+all_data$valid_prca[all_data$valid_prca==0&all_data$death_t<x]=NA #this makes everyone who died before 2 years be NA for valid prca
+
+
+#finally bring in family history from UKBB data
+
+family_history=read.dta13("_________________________",select.cols=c('n_eid','n_20107_0_0','n_20107_0_1','n_20107_0_2','n_20107_0_3','n_20107_0_4','n_20107_0_5','n_20107_0_6','n_20107_0_7','n_20107_0_8','n_20107_0_9','n_20107_1_0','n_20107_1_1','n_20107_1_2','n_20107_1_3','n_20107_1_4','n_20107_1_5','n_20107_1_6','n_20107_1_7','n_20107_2_0','n_20107_2_1','n_20107_2_2','n_20107_2_3','n_20107_2_4','n_20107_2_5','n_20107_2_6','n_20107_2_7','n_20110_0_0' ,'n_20110_0_1',  'n_20110_0_2',  'n_20110_0_3',  'n_20110_0_4',  'n_20110_0_5',  'n_20110_0_6',  'n_20110_0_7',  'n_20110_0_8' ,'n_20110_0_9',  'n_20110_0_10', 'n_20110_1_0',  'n_20110_1_1',  'n_20110_1_2',  'n_20110_1_3',  'n_20110_1_4',  'n_20110_1_5' ,'n_20110_1_6',  'n_20110_2_0',  'n_20110_2_1',  'n_20110_2_2',  'n_20110_2_3',  'n_20110_2_4',  'n_20110_2_5',  'n_20110_2_6'))
+
+temp=family_history=='Prostate cancer'
+prostate_hist=rowSums(temp,na.rm=TRUE)>0
+family_history$prostate_hist=prostate_hist
+prostate_hist=select(family_history,c('n_eid','prostate_hist'))
+all_data=inner_join(all_data,prostate_hist)
+
+temp=(family_history=='Prostate cancer'|family_history=='Breast cancer')
+cancer_hist=rowSums(temp,na.rm=TRUE)>0
+family_history$cancer_hist=cancer_hist
+cancer_hist=select(family_history,c('n_eid','cancer_hist'))
+all_data=inner_join(all_data,cancer_hist)
+
+#all_data$prostate_hist=all_data$cancer_hist #DELETE THIS FOR ONLY PROSTATE CANCER HISTORY
+
+#code up ever smoker and current smoker
+all_data=all_data%>%mutate(currentsmoker=smoker>1,eversmoker=smoker>0)
+
+```
+
+```{r, include=FALSE}
+
+## this bit is where all the actual analysis happens
+
+
+
+# This function, rocauc, takes a fomula and a data frame and returns a roc object, it's useful to have it there for later
+rocauc=function(form,dataframe){
+  logit <- glm(form, data = dataframe, family = "binomial")
+  prob = predict(logit, newdata = dataframe, type = "response")
+  roc = roc(dataframe$valid_prca ~ prob, plot = TRUE, print.auc = TRUE, ci=TRUE)
+  return(roc)
+}
+
+# This function takes a binary variable and returns a proportionality test to find the confidence interval. It returns it as a string
+binaryci=function(binarylist){
+	binarylist=binarylist[!is.na(binarylist)]
+	test1=100*prop.test(sum(binarylist), length(binarylist), conf.level=0.95)$conf.int[c(1,2)]%>%as.numeric()%>%signif(2)
+	test2=100*prop.test(sum(binarylist), length(binarylist), conf.level=0.95)$estimate%>%as.numeric()%>%signif(2)
+	return(paste(as.character(test2),'% (',as.character(test1[1]),'%-',as.character(test1[2]),'%)',sep=''))
+}
+
+# These two lines set up some local options
+options(bitmapType="cairo")
+source('~/HG_utility.R')
+
+#model frame is important because this dataframe only has people who have a symptom and no prior record of cancer (but includes the people that died during study period, identified by valid_prca==na. I need to remove people who already had cancer because they're not elegible under any model.
+
+symptom_frame=all_data%>%filter(!is.na(indexage))
+#early index is an index of the people who had cancer prior to symptoms
+early_index=symptom_frame$indexage>symptom_frame$first_prca
+early_index[is.na(early_index)]=FALSE
+model_frame=symptom_frame[!early_index,]
+model_frame=model_frame%>%mutate(zscore=(score-mean(score,na.rm=TRUE))/sd(score,na.rm=TRUE))
+# modelframe now has the 6777 people that are elegible. symptom frame has the 6930 with symptoms
+
+## The first display item is the flowchart, but this is commented out because it's tricky to automatically place it into an RMarkdown output. To get this, run the script in the command line and then run the following commands
+
+# gprecs=dbSendQuery(con,"SELECT DISTINCT n_eid from UKB_GP_RECORDS.gp_clinical_230K_171019")%>% fetch(rsa, n=-1)
+# grViz(diagram = "digraph flowchart {
+#       # define node aesthetics
+#       node [fontname = Arial, shape = rectangle]        
+#       tab1 [label = '@@1']
+#       tab2 [label = '@@2']
+#       tab3 [label = '@@3']
+#       tab4 [label = '@@4']
+#       tab5 [label = '@@5']
+# 	    tab6 [label = '@@6']
+#       tab7 [label = '@@7']
+# # set up node layout
+#       tab1 -> tab2;
+#       tab2 -> tab3;
+#       tab3 -> tab4;
+#       tab3 -> tab5;
+# 	    tab5 -> tab7;
+# 	    tab5 -> tab6; 	    
+#       }
+#       [1]: paste('N=',all_data%>%nrow(),'\\n Unrelated white Europeans in UKBB')
+#       [2]: paste('N=',nrow(all_data%>%filter(gp_records==1)),'\\n With GP record data')
+#       [3]: paste('N=',nrow(all_data%>%filter(!is.na(indexage))),'\\n With prostate cancer symptoms')
+#       [4]: paste('N=',nrow(model_frame%>%filter(valid_prca==FALSE)),'\\n No cancer within 2 years \\n (control definition)')
+#       [5]: paste('N=',nrow(all_data%>%filter(first_prca-indexage<=2)),'\\n Cancer within 2 years of index date')
+#       [6]: paste('N=',nrow(all_data%>%filter(first_prca-indexage>=0&first_prca-indexage<=2)),'\\n Cancer within 2 years \\n (case definition)')
+# 	    [7]: paste('N=',nrow(all_data%>%filter(indexage>first_prca)),'\\n Cancer record prior\\n to first symptom \\nrecord (excluded)')
+#       ")
+
+## this bit of code calculates the supplementary table 2, which is the percentage of people with each symptom
+
+
+symptomsums=model_frame%>%select(LUTS,Incontinence,Nocturia,Hesitancy,Frequency,Urgency,Retention,PoorStream,DoubleVoiding)%>%colSums()
+symptoms=names(symptomsums)
+symptomn=as.numeric(symptomsums)
+symptomper=(100*as.numeric(symptomsums/nrow(model_frame)))%>%round(1)
+symptomstats=data.frame(symptoms,symptomn,symptomper)%>%rename(symptom=symptomn,n=symptomn,percent=symptomper)
+
+
+
+
+
+## The next display item is table 1 - the observational associations. For this, I need a dataframe that only contains valid_prcas
+
+logreg=function(frame,var){
+	#this is a big function. First it runs a logistic regression of var against valid prca in the dataframe frame. Then it pulls out summary statistics for cases and controls but it needs to handle binary phenotypes differently
+	form=paste('valid_prca',var,sep='~')
+	summaryframe=glm(form,data=frame,family=binomial)%>%summary() #run a log reg
+	summaryframe=summaryframe$coefficients%>%as.data.frame()%>%rename(p=`Pr(>|z|)`)%>%mutate(OR=exp(Estimate))%>%mutate(l95=exp(Estimate-1.96*`Std. Error`),u95=exp(Estimate+1.96*`Std. Error`))%>%mutate(OR=round(OR,2),l95=round(l95,2),u95=round(u95,2),p=signif(p,2)%>%as.character())%>%mutate(variable=var,cases=NA,controls=NA)%>%select(c('variable','cases','controls','OR','l95','u95','p'))%>%slice(2) #this makes a dataframe with the variable name, the case and control average, OR, L95, U95 and p. But it doesn't have the case and control average
+	colindex=names(frame)==var
+	controlframe=frame%>%filter(valid_prca==0)
+	caseframe=frame%>%filter(valid_prca==1)
+	if (var=='bmi'|var=='indexage'){
+		summaryframe$cases=paste(mean(caseframe[,colindex],na.rm=TRUE)%>%round(2),'+/-',sd(caseframe[,colindex],na.rm=TRUE)%>%round(2),sep='')
+		summaryframe$controls=paste(mean(controlframe[,colindex],na.rm=TRUE)%>%round(2),'+/-',sd(controlframe[,colindex],na.rm=TRUE)%>%round(2),sep='')}else{
+		summaryframe$cases=paste(sum(caseframe[,colindex],na.rm=TRUE)%>%round(2),' (',(100*mean(caseframe[,colindex],na.rm=TRUE))%>%round(2),'%)',sep='')
+		summaryframe$controls=paste(sum(controlframe[,colindex],na.rm=TRUE)%>%round(2),' (',(100*mean(controlframe[,colindex],na.rm=TRUE))%>%round(2),'%)',sep='')
+	}
+	return(summaryframe)
+}
+
+
+#Now run that on all covariates
+table1=rbind(
+logreg(model_frame,'bmi'),
+logreg(model_frame,'indexage'),
+logreg(model_frame,'currentsmoker'),
+logreg(model_frame,'eversmoker'),
+logreg(model_frame,'prostate_hist'))
+rownames(table1)<- NULL
+table1
+
+# now run the basic logistic regresison of grs against prostate cancer, and store the result in a way that I can easily extract later
+
+basemod=glm(valid_prca~zscore,data=model_frame,family=binomial)%>%summary()
+baseOR=round(exp(basemod$coefficients[2,1]),2)
+baseL95=round(exp(basemod$coefficients[2,1]-1.96*basemod$coefficients[2,2]),2)
+baseU95=round(exp(basemod$coefficients[2,1]+1.96*basemod$coefficients[2,2]),2)
+basep=as.character(signif(basemod$coefficients[2,4],2))
+
+
+
+#Calculate grs quintile and store as a new variable (these is probably a neater way to do this
+scorequin=quantile(model_frame$score,probs = seq(0, 1, 1/5))
+model_frame=model_frame%>%mutate(grs_quintile=NA)
+model_frame$grs_quintile[model_frame$score<scorequin[2]]=1
+model_frame$grs_quintile[model_frame$score<scorequin[3]&model_frame$score>scorequin[2]]=2
+model_frame$grs_quintile[model_frame$score<scorequin[4]&model_frame$score>scorequin[3]]=3
+model_frame$grs_quintile[model_frame$score<scorequin[5]&model_frame$score>scorequin[4]]=4
+model_frame$grs_quintile[model_frame$score>scorequin[5]]=5
+
+# Compile a table with the incidence rates split by grs quantile and age boundary. The columns will be the quintile, and the age categories. However, the last row will be the n for each row
+
+quintile=c('First','Second','Third','Fourth','Fifth','n')
+
+under50=c(
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==1&model_frame$indexage<50]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==2&model_frame$indexage<50]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==3&model_frame$indexage<50]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==4&model_frame$indexage<50]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==5&model_frame$indexage<50]),
+sum(model_frame$indexage<50&!is.na(model_frame$valid_prca)))
+
+under60=c(
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==1&model_frame$indexage>=50&model_frame$indexage<60]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==2&model_frame$indexage>=50&model_frame$indexage<60]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==3&model_frame$indexage>=50&model_frame$indexage<60]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==4&model_frame$indexage>=50&model_frame$indexage<60]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==5&model_frame$indexage>=50&model_frame$indexage<60]),
+sum(model_frame$indexage>=50&model_frame$indexage<60&!is.na(model_frame$valid_prca)))
+
+under70=c(
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==1&model_frame$indexage>=60&model_frame$indexage<70]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==2&model_frame$indexage>=60&model_frame$indexage<70]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==3&model_frame$indexage>=60&model_frame$indexage<70]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==4&model_frame$indexage>=60&model_frame$indexage<70]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==5&model_frame$indexage>=60&model_frame$indexage<70]),
+sum(model_frame$indexage>=60&model_frame$indexage<70&!is.na(model_frame$valid_prca)))
+
+over70=c(
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==1&model_frame$indexage>=70]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==2&model_frame$indexage>=70]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==3&model_frame$indexage>=70]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==4&model_frame$indexage>=70]),
+binaryci(model_frame$valid_prca[model_frame$grs_quintile==5&model_frame$indexage>=70]),
+sum(model_frame$indexage>=70&!is.na(model_frame$valid_prca)))
+
+incidence_tab_grs_age=data.frame(quintile,under50,under60,under70,over70)
+incidence_tab_grs_age
+
+# also need the overall 2 year incidence of top and bottom quintile
+top_quin_inc=binaryci(model_frame$valid_prca[model_frame$grs_quintile==1])
+bottom_quin_inc=binaryci(model_frame$valid_prca[model_frame$grs_quintile==5])
+
+
+## running all possible models for supplementary table 3
+
+
+
+modela=rocauc('valid_prca~score',model_frame%>%filter(totalsymptoms>0))
+modelb=rocauc('valid_prca~indexage',model_frame%>%filter(totalsymptoms>0))
+modelc=rocauc('valid_prca~prostate_hist',model_frame%>%filter(totalsymptoms>0))
+modeld=rocauc(paste('valid_prca~',paste(symptoms,collapse='+'),sep=''),model_frame%>%filter(totalsymptoms>0))
+
+modelab=rocauc('valid_prca~score+indexage',model_frame%>%filter(totalsymptoms>0))
+modelac=rocauc('valid_prca~score+prostate_hist',model_frame%>%filter(totalsymptoms>0))
+modelad=rocauc(paste('valid_prca~score+',paste(symptoms,collapse='+'),sep=''),model_frame%>%filter(totalsymptoms>0))
+modelbc=rocauc('valid_prca~indexage+prostate_hist',model_frame%>%filter(totalsymptoms>0))
+modelbd=rocauc(paste('valid_prca~indexage+',paste(symptoms,collapse='+'),sep=''),model_frame%>%filter(totalsymptoms>0))
+modelcd=rocauc(paste('valid_prca~prostate_hist+',paste(symptoms,collapse='+'),sep=''),model_frame%>%filter(totalsymptoms>0))
+
+modelabc=rocauc('valid_prca~score+indexage+prostate_hist',model_frame%>%filter(totalsymptoms>0))
+modelabd=rocauc(paste('valid_prca~score+indexage+',paste(symptoms,collapse='+'),sep=''),model_frame%>%filter(totalsymptoms>0))
+modelacd=rocauc(paste('valid_prca~score+prostate_hist+',paste(symptoms,collapse='+'),sep=''),model_frame%>%filter(totalsymptoms>0))
+modelbcd=rocauc(paste('valid_prca~indexage+prostate_hist+',paste(symptoms,collapse='+'),sep=''),model_frame%>%filter(totalsymptoms>0))
+
+modelabcd=rocauc(paste('valid_prca~score+indexage+prostate_hist+',paste(symptoms,collapse='+'),sep=''),model_frame%>%filter(totalsymptoms>0))
+
+modelname=c('GRS','age','FH','Symptoms','GRS+age','GRS+FH','GRS+Symptoms','age+FH','age+Symptoms','FH+Symptoms','GRS+age+FH','GRS+age+symptoms','GRS+FH+Symptoms','age+FH+symptoms','GRS+age+FH+symptoms')
+
+aucs=c(as.numeric(modela$auc)%>%round(3),as.numeric(modelb$auc)%>%round(3),as.numeric(modelc$auc)%>%round(3),as.numeric(modeld$auc)%>%round(3),as.numeric(modelab$auc)%>%round(3),as.numeric(modelac$auc)%>%round(3),as.numeric(modelad$auc)%>%round(3),as.numeric(modelbc$auc)%>%round(3),as.numeric(modelbd$auc)%>%round(3),as.numeric(modelcd$auc)%>%round(3),as.numeric(modelabc$auc)%>%round(3),as.numeric(modelabd$auc)%>%round(3),as.numeric(modelacd$auc)%>%round(3),as.numeric(modelbcd$auc)%>%round(3),as.numeric(modelabcd$auc)%>%round(3))
+
+cis=c(paste(round(modela$ci[1],3),'-',round(modela$ci[3],3),sep=''),
+paste(round(modelb$ci[1],3),'-',round(modelb$ci[3],3),sep=''),
+paste(round(modelc$ci[1],3),'-',round(modelc$ci[3],3),sep=''),
+paste(round(modeld$ci[1],3),'-',round(modeld$ci[3],3),sep=''),
+paste(round(modelab$ci[1],3),'-',round(modelab$ci[3],3),sep=''),
+paste(round(modelac$ci[1],3),'-',round(modelac$ci[3],3),sep=''),
+paste(round(modelad$ci[1],3),'-',round(modelad$ci[3],3),sep=''),
+paste(round(modelbc$ci[1],3),'-',round(modelbc$ci[3],3),sep=''),
+paste(round(modelbd$ci[1],3),'-',round(modelbd$ci[3],3),sep=''),
+paste(round(modelcd$ci[1],3),'-',round(modelcd$ci[3],3),sep=''),
+paste(round(modelabc$ci[1],3),'-',round(modelabc$ci[3],3),sep=''),
+paste(round(modelabd$ci[1],3),'-',round(modelabd$ci[3],3),sep=''),
+paste(round(modelacd$ci[1],3),'-',round(modelacd$ci[3],3),sep=''),
+paste(round(modelbcd$ci[1],3),'-',round(modelbcd$ci[3],3),sep=''),
+paste(round(modelabcd$ci[1],3),'-',round(modelabcd$ci[3],3),sep=''))
+
+
+### produce ROC curve for the integrated risk score with score and index age
+
+logit <- glm(valid_prca~score+indexage, data = model_frame, family = "binomial")
+  combined = predict(logit, newdata = model_frame, type = "response")
+  roc.list=roc(model_frame$valid_prca ~ score+combined,data = model_frame, plot = TRUE, print.auc = TRUE, ci=TRUE)
+
+ci.list <- lapply(roc.list, ci.se, specificities = seq(0, 1, l = 250))
+
+dat.ci.list <- lapply(ci.list, function(ciobj) 
+  data.frame(x = as.numeric(rownames(ciobj)),
+             lower = ciobj[, 1],
+             upper = ciobj[, 3]))
+roc.list=roc.list[2]
+p <- ggroc(roc.list) + theme_minimal() + geom_abline(slope=1, intercept = 1, linetype = "dashed", alpha=0.7, color = "grey") + coord_equal()
+p <- p + geom_ribbon(
+    data = dat.ci.list[[2]],
+    aes(x = x, ymin = lower, ymax = upper),
+    fill = '#ff0000' ,
+    alpha = 0.2,
+    inherit.aes = F) 
+
+roc_curve=p+HGtheme+theme(axis.text=element_text(size=14),legend.title = element_text(size = 18),legend.text = element_text(size = 14),axis.title=element_text(size=18))
+
+
+
+# diagnostic stats of the integrated risk score (Table 3)
+
+model_frame_na_rm=model_frame%>%filter(!is.na(valid_prca)) # this bit can't have any nas on valid_prca
+
+model=glm(valid_prca~score+indexage,data=model_frame_na_rm,family=binomial)
+prob <- predict(model, newdata=model_frame_na_rm, type="response")
+
+# this function takes a level and outputs the spec, sens, ppv, npv, youdens
+formatepi=function(level,frame,prob){
+	predicted.classes <- prob > level
+	atab=sum(predicted.classes==TRUE & frame$valid_prca==TRUE)
+	btab=sum(predicted.classes==TRUE & frame$valid_prca==FALSE)
+	ctab=sum(predicted.classes==FALSE & frame$valid_prca==TRUE)
+	dtab=sum(predicted.classes==FALSE & frame$valid_prca==FALSE)
+	data <- as.table(matrix(c(atab,btab,ctab,dtab), nrow = 2, byrow = TRUE))
+	rval <- epi.tests(data, conf.level = 0.95)
+	df=data.frame(rval$detail)
+	out=data.frame(threshold=level,specificity=df$sp.est,sensitivity=df$se.est,PPV=df$pv.pos.est,NPV=df$pv.neg.est,YoudensJ=df$youden.est)
+	return(out%>%round(3))
+}
+
+
+epistats=rbind(
+	formatepi(0.01,model_frame_na_rm,prob),
+	formatepi(0.02,model_frame_na_rm,prob),
+	formatepi(0.03,model_frame_na_rm,prob),
+	formatepi(0.037,model_frame_na_rm,prob),
+	formatepi(0.04,model_frame_na_rm,prob),
+	formatepi(0.05,model_frame_na_rm,prob))
+	
+
+## Longitudinal survival analysis bit
+
+survframe=model_frame%>%select('n_eid','indexage','first_prca','score','grs_quintile','death_t','zscore') #need to save this frame for survival analysis
+survframe=survframe%>%mutate(t=first_prca-indexage,status=!is.na(first_prca)) #status is 1 if they ever had prostate cancer and 0 if they didn't, regardless of death date because they don't need to be excluded here
+survframe$t[is.na(survframe$t)]=x
+survframe$status[survframe$t>x]=FALSE #if they got cancer after nyear surv then they don't have cancer in the period I want to plot
+survframe$t[survframe$t>x]=x #if they got cancer after nyear surv then they don't have cancer in the period I want to plot
+
+survframe$t=pmin(survframe$t,survframe$death_t,na.rm=TRUE) #make t (the censoring date) be the minimum of t and the death date. t is then 2, if they survived to the end cancer free, the cancer diagnosis date if they got cancer, or the date they died
+
+# this is a basic PH model only using zscore
+basic_ph <- coxph(Surv(t, status) ~ zscore, data =  survframe)%>%summary()
+
+#this one uses quintiles to plot
+res.cox <- coxph(Surv(t, status) ~ grs_quintile, data =  survframe)
+
+quin_df <- data.frame(grs_quintile = c(5,4,3,2,1))
+fit <- survfit(res.cox, newdata = quin_df)
+
+# I want to turn these upside down because I want cumulative hazards	 
+fit2=fit
+fit2$surv=1-fit2$surv
+fit2$lower=1-fit2$lower
+fit2$upper=1-fit2$upper
+		 
+# make the survplot object
+rainbow_surv=ggsurvplot(fit2, conf.int = TRUE, legend.labs=c("Quintile 5","Quintile 4","Quintile 3","Quintile 2","Quintile 1"),risk.table = TRUE,data=quin_df,ylim = c(0, 0.1),legend='top',legend.title='GRS Quintile',palette=c('#FF0018','#FFA52C','#008018','#0000F9','#86007D'),
+           ggtheme=HGtheme,ylab='Cancer incidence rate',xlab='Time since symptom (years)')
+
+rainbow_surv$data.survplot$surv=1-rainbow_surv$data.survplot$surv
+rainbow_surv$data.survplot$lower=1-rainbow_surv$data.survplot$lower
+rainbow_surv$data.survplot$upper=1-rainbow_surv$data.survplot$upper
+
+rainbow_surv$plot$data$surv=1-rainbow_surv$plot$data$surv
+rainbow_surv$plot$data$lower=1-rainbow_surv$plot$data$lower
+rainbow_surv$plot$data$upper=1-rainbow_surv$plot$data$upper
+
+print(rainbow_surv$plot)
+
+ggsave("Figure 3.png", print(rainbow_surv$plot), width=12, height=6)
+
+
+plotframe=model_frame%>%filter(!is.na(valid_prca))
+plotframe$valid_prca[plotframe$valid_prca==TRUE]='Cases'
+plotframe$valid_prca[plotframe$valid_prca==FALSE]='Controls'
+
+```
+
+## Abstract
+
+Background
+Prostate cancer is highly heritable, with >250 common variants associated in genome-wide association studies. It commonly presents with non-specific lower urinary tract symptoms that are frequently associated with benign conditions. 
+
+Methods
+Cohort study using UK Biobank data linked to primary care records. Participants were men with a record showing a general practice consultation for a lower urinary tract symptom. The outcome measure was prostate cancer diagnosis within two years of consultation. 
+
+Results
+A genetic risk score (GRS) is associated with prostate cancer in symptomatic men (OR per SD increase=`r baseOR` [`r baseL95` to `r baseU95`] p=`r basep`). An integrated risk model including age and GRS applied to symptomatic men predicted prostate cancer (AUC `r aucs[5]` [`r cis[5]`]). Prostate cancer incidence was `r top_quin_inc` in the highest risk quintile. In the lowest quintile, prostate cancer incidence was <1%.
+
+Conclusions
+This study is the first to apply GRS in primary care to improve the triage of symptomatic patients. Men with the lowest genetic risk of developing prostate cancer could safely avoid invasive investigation, whilst those identified with the greatest risk could be fast-tracked for further investigation. These results have the potential to revolutionise the investigation of symptomatic patients in primary care.
+
+
+\newpage
+
+## Introduction
+
+Prostate cancer accounts for around a quarter of new cancer cases in men, approximately 48,000 per year, and is increasing by around 4% annually1. An estimated 14% of prostate cancer deaths in the UK could be avoided with earlier detection2; advanced stage at diagnosis is associated with poorer survival3. Most men with prostate cancer are diagnosed after attending primary care with symptoms4; prostate cancer screening programmes (targeting asymptomatic men) are of limited benefit5. 
+
+Lower urinary tract symptoms (LUTS), such as nocturia, urinary frequency or poor stream, are common in men aged 50 and above, and are often present at the time of a prostate cancer diagnosis. The incidence of LUTS, benign prostate enlargement, and prostate cancer all rise with increasing age, complicating attempts to accurately diagnose tumours. The evidence for an association between LUTS and risk of prostate cancer is equivocal6, and very few studies have assessed this association in a primary care population7.
+
+The UK’s National Institute for Health and Care Excellence (NICE) recommends a Prostate Specific Antigen (PSA) test for men in primary care with symptoms suggestive of prostate cancer, including LUTS, new onset erectile dysfunction, or lower back pain8. PSA is the only test currently available for detecting prostate cancer in primary care, yet the diagnostic accuracy of PSA in symptomatic men is unclear6. The most recent systematic review of the diagnostic accuracy of PSA for prostate cancer in patients with LUTS found that a PSA threshold of 4ng/mL had a sensitivity of 0.93 (95% CI 0.88, 0.96) and specificity of 0.20 (95% CI 0.12, 0.33), and the Area Under the Curve (AUC) was 0.72 (95% CI 0.68, 0.76)9.  All included studies for the review were conducted in secondary care patient cohorts, limiting the applicability of the findings to the primary care setting, where cancer incidence is lower, and therefore AUC likely to be lower, due to spectrum bias10. As the studies in that review were based on observational data, ascertainment bias and lack of follow up in PSA-negative men may mean that the true AUC of PSA in symptomatic men in primary care is lower still. 
+
+Over the past 15 years, genome-wide association studies (GWAS) have identified over 250 individual genetic variants that contribute to the development of prostate cancer, which have been combined into a clinically useful measure that reflects an individual’s risk of developing prostate cancer: a genetic risk score (GRS)11. GRS improve risk predictions based on family history alone1214 but despite promising evidence on predictive ability, there has been limited integration of GRS into clinical practice15. There are no studies of the application of a prostate cancer GRS in the targeted investigation of men with LUTS. It is not known whether genetic risk of developing prostate cancer affects the chance of it being present once a man is symptomatic for prostate cancer, or whether GRS could be helpful in selecting men for further investigation once they present with symptoms of prostate cancer.
+
+The objective of this study is to assess if a prostate cancer GRS predicted new diagnosis of prostate cancer in men in the UK Biobank who consulted their general practitioner (GP) with LUTS.
+
+\newpage
+
+## Methods
+
+### Public and Patient Involvement
+
+An existing patient and public involvement and engagement (PPI&E) group consisting of six men with personal experience of prostate cancer investigation informing on-going prostate cancer research at the University of Exeter was involved with the development of the research question for this study. Their views were specifically sought around the acceptability of developing an integrated risk model that required the incorporation of genetic information, and the additional risk factors to consider. These men felt the potential benefits in improving early detection of prostate cancer and avoiding unnecessary, invasive diagnostic tests outweighed concerns about using genetic data. They also highlighted the importance of a patient’s age and family history in assessing prostate cancer risk.
+
+### Participants
+
+Unrelated UK Biobank participants of white European ancestry were included in this study. Principal component analysis was performed using individuals from the 1000 Genomes Project prior to projection of UK Biobank individuals into the principal component space. K-means clustering was subsequently applied to classify individuals as European, with centres initiated to the mean principal component values of each 1000 Genomes sub-population. The first four principal components were used in this analysis. Related individuals were defined using a KING Kinship16 to exclude those third-degree relatives or closer. An optimal list of unrelated individuals was generated by preferentially removing individuals with the maximum number of relatives to allow maximum numbers of individuals to be included; e.g. if A was related to B and C, but B and C were not, A was removed. For a simple pair, one individual was removed at random. 
+
+Participants were included in the analysis if they had any symptoms of prostate cancer recorded in the UKBB GP records. Symptoms were defined as any of the following: incontinence, nocturia, hesitancy, frequency, urgency, retention, poor stream, double voiding, or a general code of lower urinary tract symptoms (LUTS). Read codes for each condition can be found in Supplementary Table 1. The date of the first relevant symptom on record was defined as the index date for each participant.
+
+
+### Variable definition
+Prostate cancer was defined using the earliest date of either the Read code ‘B46..’ in GP records, or the linked cancer registry data. As this study aimed to test the ability of a prostate cancer GRS to identify new prostate cancer in men with symptoms, patients with prostate cancer recorded prior to the index date were excluded. Patients in the symptomatic cohort that were diagnosed with prostate cancer within two years of the index date were treated as cases. Patients with no record of a prostate cancer diagnosis within two years of the index date were considered controls. Controls may have been diagnosed with prostate cancer more than two years after the index date; this follow up period was selected so that only prostate cancers that could be causing symptoms were detected. These could be diagnosed at the time the patient is symptomatic. While there is no perfect cutoff date for this, two years is a commonly accepted limit in previous research in cancer diagnosis7,17237,1723.
+
+A genetic risk score for prostate cancer was derived using the 269 known risk variants reported in a recent trans-ancestry genome-wide meta-analysis; the included variants are described in Conti et al (2021)11. Weighting for each single nucleotide polymorphism (SNP) was given by the log of the European odds ratio from Supplementary Table 4. These weights were used over the UK Biobank weights to avoid issues with overfitting. The GRS was calculated for each UK Biobank participant using the sum of the weights multiplied by the participants genotype. 
+
+Body mass index (BMI) was defined using UK Biobank’s Data-Field 21001 and reported as mean kg/m2, ± standard deviation. Smoking status (ever or never) was defined using Data-Field 1239. Family history of prostate cancer was defined using self-report data (Data-Field 20111). These were measured at baseline UKBB recruitment. 
+
+Only a small proportion of the cohort had a PSA test result on record, and these were abnormal; the AUC for PSA alone was >0.9 which is unrealistic compared to the literature and likely to be the result of ascertainment bias9. As PSA is part of the current diagnostic pathway to determine if a patient is investigated for prostate cancer, it has a direct causal effect on whether an individual will be diagnosed with prostate cancer independently of the test’s ability to predict that outcome. Any model of PSA and GRS in an observational study like UK Biobank will be significantly biased towards PSA; patients with a negative PSA test are not followed up and therefore unlikely to be diagnosed with prostate cancer, even if it exists. Therefore, this study compared the performance of a prostate cancer GRS to published reports of PSA diagnostic accuracy. 
+
+### Statistical Methods
+
+
+All analysis was conducted using R 4.0.3 Bunny-Wunnies Freak Out. The cohort characteristics were described and tests for associations performed with baseline variables: index age, family history, smoking status and BMI. The association between the GRS and a prostate cancer diagnosis within two years of symptoms was evaluated in a simple logistic regression model.
+
+An integrated risk model was developed by including all permutations of predictor variables that reached nominal significance (p<0.05) plus symptoms in addition to the GRS to test if predictive power was enhanced in any combination. As some participants had multiple symptoms recorded at the index date, symptom profile could not be considered a categorical variable, and was modelled by treating each symptom as its own binary variable. . Receiver operating characteristic (ROC) area under the curve (AUC) was estimated with 95% confidence intervals (CIs) for each possible integrated risk model to measure overall diagnostic performance. Diagnostic performance was estimated for incidence thresholds of 1, 2, 3, 4, and 5%; 3% is the current NICE threshold for investigation in guidance NG128, although a drop to 2% is under consideration24. Patients have reported that they would prefer to be investigated at risk thresholds as low as 1%25. The study was reported in line with the Genetic Risk Prediction Studies (GRIPS) guidelines26. 
+
+### Ethics statement
+
+This research has been conducted using the UK Biobank Resource. This work was carried out under UK Biobank project number 74981. Ethics approval for the UK Biobank study was obtained from the North West Centre for Research Ethics Committee (11/NW/0382)27. Written informed consent was obtained from all participants.
+
+### Patient and Public Involvement
+
+Patients or the public were not involved in the design, or conduct, or reporting, or dissemination plans of our research
+
+
+\newpage
+
+## Results
+
+### Cohort Description
+
+```{r, include=FALSE}
+# Figure 1 goes here, but it's awkward to automatically play a DiagrammR in an RMarkdown Document. But while I'm here I'm going to define some variables for the next paragraph
+num_symptoms=nrow(all_data%>%filter(!is.na(indexage)))
+num_earlycancer=nrow(all_data%>%filter(indexage>first_prca))
+num_include=num_symptoms-num_earlycancer
+num_cancer=nrow(model_frame%>%filter(valid_prca==TRUE))
+num_left=num_include-num_cancer
+num_death=sum(is.na(model_frame$valid_prca)) #the only reason valid_prca can be NA is through death omissions
+num_controls=num_left-num_death
+
+```
+
+```{r, fig.cap = "Figure 1 - Flowchart showing how cases and controls were obtained (Not produced by RMarkdown)",echo=FALSE}
+```
+
+Of the `r nrow(all_data)` unrelated white European men in UKBB, `r nrow(all_data%>%filter(gp_records==1))` had linked GP records, of which `r num_symptoms` individuals reported prostate cancer symptoms. `r num_earlycancer` had evidence of prostate cancer prior to first symptom report and were excluded. Of the `r num_include` without pre-exisiting prostate cancer, `r num_cancer` had a record of prostate cancer within two years and were included as cases. Of the remaining `r num_left`, `r num_death` died during the 2 year followup and were excluded from case-control analyses, leaving `r num_controls` controls (Figure 1). `r round(100*num_cancer/(num_cancer+num_controls),1)`% of those included in the model were cases. Over 75% of the cohort were included following reports of LUTS, nocturia or frequency (Supplementary Table 2).
+
+Those who went on to develop prostate cancer tended to be older and have a family history of prostate cancer, but there was no association with BMI or smoking status (Table 1).
+
+```{r, echo=FALSE}
+knitr::kable(table1,caption = "Table 1 - Observational associations between cases and controls, estimated with logistic regression")
+```
+
+### A GRS predicts prostate cancer in men with symptoms
+
+```{r include=FALSE}
+meancase=mean(model_frame$score[model_frame$valid_prca==1],na.rm=TRUE)%>%round(2)
+meancontrol=mean(model_frame$score[model_frame$valid_prca==0],na.rm=TRUE)%>%round(2)
+sdcase=sd(model_frame$score[model_frame$valid_prca==1],na.rm=TRUE)%>%round(2)
+sdcontrol=sd(model_frame$score[model_frame$valid_prca==0],na.rm=TRUE)%>%round(2)
+```
+
+In men with symptoms, the prostate cancer genetic risk score was associated with development of prostate cancer within the next two years. In the `r num_cancer` men with a prostate cancer diagnosis within two years of symptoms, the mean GRS was `r meancase` (SD `r sdcase`) vs `r meancontrol` (SD `r sdcontrol`) in the `r num_controls` men who were not diagnosed with prostate cancer (OR=`r baseOR` [`r baseL95` to `r baseU95`] p=`r basep`) per SD increase in GRS. Supplementary Figure 1 shows the distributions of genetic risk score in men who were diagnosed with cancer within two years of symptom onset vs those who were not.
+
+
+```{r, fig.cap = "Figure 2 - Cumulative hazard plot showing prostate cancer risk over the 2 year period stratified by GRS quintile",echo=FALSE}
+print(rainbow_surv$plot)
+ggsave("Figure 2.png", print(rainbow_surv$plot), width=12, height=8)
+```
+
+Figure 2 shows the incidence rate over time, stratified by GRS quintile. Individuals with prostate cancer symptoms who were in the lowest quintile of the GRS had a `r bottom_quin_inc` chance to develop prostate cancer by the end of the 2 year period, while individuals in the top quintile had an `r top_quin_inc` chance. Using Cox-PH modelling, the GRS had a hazard ratio of `r round(basic_ph$coefficients[2],2)` 
+(`r round(exp(basic_ph$coefficients[1]-1.96*basic_ph$coefficients[3]),2)` - `r round(exp(basic_ph$coefficients[1]+1.96*basic_ph$coefficients[3]),2)`), p=`r as.character(signif(basic_ph$coefficients[5],2))` per SD increase in GRS.
+
+
+
+### An integrated risk model of GRS and age has predictive power over and above GRS alone
+
+An integrated risk model including GRS and age returned a ROC area under the curve (AUC) of `r aucs[5]` (95% CI `r cis[5]`) (ROC curve shown in Supplementary Figure 2). This was substantially stronger than either of the two individual covariates (GRS AUC: `r aucs[1]` [95% CI `r cis[1]`] and age AUC: `r aucs[2]` [95% CI `r cis[2]`]). Adding family history and symptom profile to the integrated risk model provided a negligible increase in predictive power (AUC: `r aucs[15]` [95% CI `r cis[15]`], Supplementary Table 3 [AUCs and 95% CIs of all permutations of GRS, age, family history and symptom profile]). 
+
+
+Predicted probability of 2-year prostate cancer incidence and diagnostic accuracy statistics are reported in Table 3 at thresholds of 1, 2, 3, 4 and 5%, in addition to the probability threshold that maximizes Youden’s J statistic (3.7%). The integrated risk model had a negative predictive value of greater than 99% for thresholds of 0.02 or less. 
+
+
+```{r, echo=FALSE}
+knitr::kable(epistats,caption = "Table 2: diagnostic statistics estimated for risk thresholds of 1, 2, 3, 4, and 5%, plus the optimum threshold of 3.7% recommended by the model.")
+```
+
+In Table 3 we show the 2-year incidence rates of prostate cancer stratified by age decade and GRS quintile. An incidence of < 1% was observed in those aged 40 years and under in the bottom four GRS quintiles and aged 40-50 years in the bottom two GRS quintiles. Men aged 70 years and over had a >1% incidence rate in every GRS quintile, while men over 60 in the top GRS quintile had a >10% incidence rate. 
+
+```{r, echo=FALSE}
+knitr::kable(incidence_tab_grs_age,caption = "Table 3: 2-year incidence rates of prostate cancer, broken down by age decade and GRS quintile.")
+```
+
+## Discussion
+
+This study is the first to demonstrate that genetic risk scores can improve the selection of men for suspected prostate cancer investigation in primary care, over and above presenting clinical features. NICE guidance NG12 proposes that any combination of clinical features that represent a >3% chance of cancer should be investigated8, although a reduction to 2% is under consideration to improve cancer outcomes24. The integrated risk model presented in this study could be used to risk stratify men with LUTS above and below this threshold. All individuals in the lower 3 quintiles (60% of men in UKBB with symptoms) could be ruled out from further investigations under the current guidelines using just the GRS. Individuals in the lower 2 quintiles of GRS (40%) would be ruled out under the proposed 2% threshold. Using the proposed 2% threshold, the integrated risk model suggests excluding GRS quintiles 1-4 in those under 60 and quintile 1 in those 60-70. 
+
+### Limitations
+
+This analysis was limited to white European ancestry due to the lack of ethnic diversity in UKBB; a substantial limitation as black men are twice as likely to be diagnosed with, and suffer worse outcomes from, prostate cancer28. As recruitment occurred between 2006 and 2010 when the men were aged 40 to 70 years, the cohort is enriched with younger men with symptoms. This may result in an overestimate of the power of GRS if it is stronger at identifying prostate cancer in younger men; Conti et al’s GRS was significantly associated with younger age at diagnosis11. However, this could also result in an underestimate of the true predictive value of GRS in symptomatic men. This study examines men in UKBB with a code for LUTS, which may not represent all men seeing their GP with such symptoms. There is also a lack of standardised follow up across the cohort.
+
+### Comparison to existing literature
+
+The integrated risk model outperforms the diagnostic accuracy of PSA as reported in the literature: AUC 0.72 (95% CI 0.68 to 0.76)9. We hypothesise that the optimal predictive model would incorporate PSA, GRS, and other clinical features. Oto et al’s model achieved AUC of 0.71 (95% CI: 0.670.75) combining total PSA, free PSA, and age as predictors29, although only total PSA is available in UK primary care. Seibert et al (2018) developed a model that predicted age at onset of prostate cancer in men enrolled in the PROTECT trial to a high degree of accuracy in their validation study (z=15.4, p<10-16)30. That trial focussed on screening, rather than symptomatic detection, but also found that family history of prostate cancer added little predictive value. In that study, PSA was more predictive of prostate cancer in increasing centiles of risk score. Futher research is needed to determine the best way to combine GRS with existing triage tools available in primary care, such as the PSA test, and to externally validate integrated risk models.  Identifying clinically significant prostate cancer is a key focus of prostate cancer diagnosis research efforts, but could not be assessed in the present study due to a lack of cancer staging data. About half of men with aggressive prostate cancer in Conti et al’s study had a GRS in the top 20%11.
+
+### Clinical implications
+This work has significant implications for the suspected prostate cancer investigation pathway in UK primary care. With the integration of GRS into routine clinical care, men identified as being at the greatest risk of prostate cancer could be prioritised for investigation, resulting in expedited diagnosis. The best available evidence supports the position that cancer diagnosis at an earlier disease stage is beneficial for survival31. Conversely, those identified as being at a very low risk of cancer by the integrated risk model could safely avoid invasive investigations, reducing patient harm, and reducing demand on secondary care services. 
+
+The ideal place for an integrated risk model in primary care would be as stratification tool to support GP decision making for patients with symptoms of possible cancer, perhaps in deciding when to offer a PSA test. We have shown that, for prostate cancer, 40% of men with LUTS could avoid investigation for suspected cancer. Genetic sequencing is not currently available in UK primary care but current trends suggest that it will become part of routine practice in the future. The NHS will be the first national health care system to offer whole genome sequencing as part of routine care32. The NHS Genomic Medicine Service has included the use of GRS as a key area of interest33 and programmes such as Our Future Health34 will facilitate translation of GRS studies in the future. The present study supports that development and shows for the first time that the availability of genomic data in primary care could benefit men with prostate cancer symptoms, although further research to consider patient preferences for genomic testing will be vital. Our integrated risk model approach could be applied using published GRS for other cancer types across multiple suspected cancer pathways; this has the potential to revolutionise the investigation of symptomatic patients in primary care. 
+
+
+
+\newpage
+
+## Supplementary Table 1
+
+```{r, echo=FALSE}
+knitr::kable(codecategories,caption = "Read 3 codes used to define prostate cancer and symptoms")
+```
+
+\newpage
+
+## Supplementary Table 2
+
+```{r, echo=FALSE}
+knitr::kable(symptomstats,caption = "Number of people included broken down by which symptom they were included for. Note that as it is possible for an individual to report two symptoms on the index date, n sums to more than the cohort total and percent sums to more than 100.")
+```
+
+\newpage
+
+## Supplementary Table 3
+
+```{r, echo=FALSE}
+knitr::kable(data.frame(modelname,aucs,cis),caption = "Area Under the Curve (AUC) statistics of all permutations of GRS, age, family history (FH) and symptom profile.")
+```
+
+\newpage
+
+## Supplementary Figure 1
+
+```{r, fig.cap = "Figure 2 - Density plot showing the distributions in the genetic risk score of those who were diagnosed with cancer within 2 years of symptoms (red) and those who were not (blue). ",echo=FALSE}
+p2=ggplot(plotframe, aes(x=score,fill = valid_prca)) + geom_density(alpha=0.4)+HGtheme+scale_fill_discrete(name = "", labels = c("Prostate cancer\n within 2 years\n of symptoms","No prostate cancer\n within 2 years\n of symptoms"))+theme(axis.text=element_text(size=14),legend.title = element_text(size = 18),legend.text = element_text(size = 14),axis.title=element_text(size=18))
+p2
+ggsave('Figure S1.png',p2,width=12,height=8)
+```
+
+## Supplementary Figure 2
+
+```{r, fig.cap = "Figure 3 - ROC curve of an integrated risk model including GRS and age to predict prostate cancer within 2 years of symptoms. The ROC AUC was 0.768 (95% CI 0.739 to 0.796)",echo=FALSE}
+roc_curve
+ggsave('Figure S2.png',roc_curve,width=12,height=8)
+```
